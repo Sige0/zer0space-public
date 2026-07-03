@@ -71,9 +71,9 @@ Public services are exposed exclusively through a **Cloudflare Tunnel** (direct 
 | zs-node-02 | Manager | 10.0.0.2 | 8 GB | 256 GB | Swarm control · DNS (Technitium) |
 | zs-node-03 | Manager | 10.0.0.3 | 8 GB | 256 GB | Swarm control · cloudflared |
 | zs-worker-01 | Worker | 10.0.0.4 | 32 GB | 1 TB | Jellyfin · NFS storage |
-| zs-worker-02 | Worker | 10.0.0.5 | 8 GB | 256 GB | General workloads |
-| zs-worker-03 | Worker | 10.0.0.6 | 8 GB | 256 GB | General workloads (Stirling-PDF) |
-| zs-worker-04 | Worker | 10.0.0.7 | 8 GB | 256 GB | General workloads |
+| zs-worker-02 | Worker | 10.0.0.5 | 16 GB | 256 GB | General workloads |
+| zs-worker-03 | Worker | 10.0.0.6 | 16 GB | 256 GB | General workloads (Stirling-PDF) |
+| zs-worker-04 | Worker | 10.0.0.7 | 24 GB | 256 GB | General workloads |
 
 All nodes run **Debian 12** bare-metal (no Proxmox, no VMs). Docker Engine installed via `get.docker.com`.
 
