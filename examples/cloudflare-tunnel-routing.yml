@@ -1,0 +1,65 @@
+# Example: Routing a service through a Cloudflare Tunnel
+#
+# Pattern: cloudflared routes directly to the Docker Swarm service DNS name
+# inside the overlay network. No reverse proxy needed.
+#
+# Service DNS format: <stack-name>_<service-name>:<port>
+# Example: myapp_web:3000
+#
+# Prerequisites:
+#   1. A Cloudflare account with a zone (your domain)
+#   2. A Cloudflare Tunnel created in the Zero Trust dashboard
+#   3. TUNNEL_TOKEN set as a Docker secret or environment variable
+#   4. An overlay network shared between cloudflared and your services
+#
+# In the Cloudflare Zero Trust dashboard, under "Public Hostnames":
+#   myapp.<DOMAIN>  →  http://myapp_web:3000
+#
+# Cloudflare Access policies sit in front of every hostname — set them up
+# in the Zero Trust dashboard to require GitHub login (or any IdP).
+
+networks:
+  # This overlay network must be declared external if cloudflared is in its
+  # own stack. The service stack creates it; cloudflared attaches to it.
+  cloudflared_proxy:
+    external: true
+
+services:
+
+  # ── Cloudflare Tunnel daemon ──────────────────────────────────────────────
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    command: tunnel --no-autoupdate run
+    environment:
+      # Prefer a Docker secret over a plain env var for the token.
+      # To use a secret: create it with `docker secret create tunnel_token -`
+      # and reference it via secrets: below + TUNNEL_TOKEN_FILE=/run/secrets/tunnel_token.
+      - TUNNEL_TOKEN=<YOUR_TUNNEL_TOKEN>
+    networks:
+      - cloudflared_proxy
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          # Pin to a specific node so the tunnel endpoint is stable.
+          - node.hostname == <NODE_HOSTNAME>
+      restart_policy:
+        condition: on-failure
+      resources:
+        limits:
+          cpus: "0.10"
+          memory: 64M
+
+  # ── Your application ──────────────────────────────────────────────────────
+  web:
+    image: your-app-image:latest
+    networks:
+      - cloudflared_proxy      # must be on the same overlay as cloudflared
+    environment:
+      - TZ=Europe/Zurich
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 256M

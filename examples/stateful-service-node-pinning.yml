@@ -1,0 +1,92 @@
+# Example: Stateful service with node-pinning and a bind-mount volume
+#
+# Pattern: services that write persistent data must be pinned to the node
+# where the data actually lives. Docker Swarm has no built-in mechanism to
+# follow a volume when a service is rescheduled to a different node.
+#
+# This example shows:
+#   - Pinning a service to a specific node via node.hostname constraint
+#   - Using a bind-mount instead of a named volume (predictable path, easy backup)
+#   - A read-only socket-proxy to give the service Swarm API access
+#     without exposing the full Docker socket
+#   - Resource limits (important in a shared cluster)
+#
+# Before first deploy, create the data directory on the target node:
+#   mkdir -p /opt/myapp/data
+
+networks:
+  myapp_net:
+    driver: overlay
+    attachable: false   # internal only — no manual container attachment
+
+services:
+
+  # ── Application ───────────────────────────────────────────────────────────
+  app:
+    image: your-app-image:latest
+    ports:
+      - target: 3000
+        published: 8080
+        mode: host          # host mode avoids Swarm's routing mesh; useful when
+                            # you want to address the specific node's port directly
+    volumes:
+      # Bind-mount: the data directory must exist on the pinned node before
+      # the service starts. Named volumes work too, but bind-mounts make the
+      # backup path obvious (/opt/myapp/data → rsync/restic/whatever).
+      - /opt/myapp/data:/data
+    networks:
+      - myapp_net
+    environment:
+      - TZ=Europe/Zurich
+      - DATA_DIR=/data
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          # Pin to the node that holds the data. Change to your actual hostname.
+          - node.hostname == <NODE_HOSTNAME>
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 256M
+        reservations:
+          cpus: "0.05"
+          memory: 64M
+
+  # ── Read-only Docker socket proxy ─────────────────────────────────────────
+  # Exposes only the Swarm API endpoints the app needs.
+  # The app never touches /var/run/docker.sock directly.
+  socketproxy:
+    image: tecnativa/docker-socket-proxy:latest
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      # Allow only what the app actually uses. Everything else defaults to 0.
+      - SERVICES=1
+      - NODES=1
+      - TASKS=1
+      # Explicitly deny write-capable endpoints.
+      - POST=0
+      - AUTH=0
+      - CONTAINERS=0
+      - IMAGES=0
+      - NETWORKS=0
+      - VOLUMES=0
+    networks:
+      - myapp_net          # isolated: no internet access, no other stacks
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          # Must be on the same node as the app so it can serve local socket.
+          - node.hostname == <NODE_HOSTNAME>
+      resources:
+        limits:
+          cpus: "0.10"
+          memory: 64M
+        reservations:
+          cpus: "0.01"
+          memory: 16M
