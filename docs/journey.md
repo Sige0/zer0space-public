@@ -114,6 +114,72 @@ For services that don't have their own authentication (like Stirling-PDF), Cloud
 
 ---
 
+## The Stateless Swarm Refactor: Why Nodes Became Disposable
+
+For the first several months, the Swarm nodes weren't actually stateless. The dashboard's SQLite file lived in a bind-mount on whichever manager node it happened to be pinned to. Portainer's own data volume lived inside the Swarm it was managing. A few smaller services wrote to local paths on specific workers "because that's where the disk was."
+
+This worked, right up until it didn't: losing a node meant losing whatever bind-mounted data lived on it, and re-provisioning a node meant remembering — by hand — which paths needed to exist before a stack would come back healthy. That's the opposite of the GitOps promise. The repo was supposed to be the single source of truth; in practice, a chunk of the truth was sitting on individual disks that weren't in Git at all.
+
+The fix was to draw a hard line: **the Swarm holds no state.** Every Swarm node — manager or worker — had to become genuinely interchangeable: wipe it, reinstall Debian, `docker swarm join`, done. No data recovery step, because there's no data to recover.
+
+That line only works if persistent data has somewhere else to live, so the cluster grew two new dedicated machines that sit deliberately outside the Swarm:
+
+- **`zs-store-01`**, an NFS server. Every Swarm service that needs a data volume mounts it from here instead of a local path. Docker's `local` volume driver with `type: nfs` options makes this a drop-in replacement for a bind-mount from the service's point of view — see [examples/nfs-volume-service.yml](../examples/nfs-volume-service.yml).
+- **`zs-state-01`**, a plain-Docker host (deliberately *not* a Swarm member) for the handful of things that genuinely want local, low-latency disk instead of a network filesystem — PostgreSQL being the main one. More on why Postgres didn't just go on NFS below.
+
+The result: the Swarm went from 6 nodes to 7 (a fourth worker, `zs-worker-04`, was added around the same time for extra headroom), and the homelab as a whole went from 7 devices to 9. But the meaningful change isn't the node count — it's that all 7 Swarm nodes are now genuinely disposable, and only two machines in the whole fleet actually need to be treated carefully.
+
+---
+
+## The Portainer Migration Pain
+
+Portainer had a bootstrapping problem that took an outage to notice: it was deployed *as a Swarm stack*, managing the very Swarm it was running on, with its own data volume bind-mounted to whichever manager node it landed on.
+
+That's fine until the node holding Portainer's data goes down. At that point the tool you'd normally reach for to fix a broken Swarm — Portainer — is the thing that's broken. Recovering meant SSHing into a manager by hand and running `docker service` commands directly, exactly the workflow GitOps was supposed to eliminate. The control plane depended on the infrastructure it was supposed to control.
+
+The fix: pull Portainer out of the Swarm entirely and run it as a standalone Docker container on `zs-state-01`, talking to the Swarm as a **remote** Docker environment over TLS instead of the local socket.
+
+The migration itself was the genuinely painful part:
+
+- Portainer's environment registration had to be redone against a remote TCP endpoint, which meant generating and distributing new TLS client certificates for the Docker daemon on each manager node (`dockerd` doesn't expose the remote API by default — that's an intentional security posture, not an oversight, so enabling it required care).
+- Every existing GitOps webhook URL pointed at the old Portainer instance's internal address. Each one had to be regenerated and re-pasted into the corresponding GitHub Actions workflow / repo webhook config — there's no bulk-migrate for this.
+- Portainer's own stack definitions (the list of what to deploy from the repo) live in Portainer's database, not in the Git repo itself. That state had to be manually re-created after the move, because the old Portainer instance's database wasn't something worth carrying forward — it was mixed up with the very bind-mount-on-a-random-node problem this migration was fixing.
+- Swarm-side, only a lightweight **Portainer agent** remains, running as a global stateless service. It has no data of its own — if it disappears, redeploying it is a no-op operationally.
+
+The downtime was measured in a very tense hour, not days, but it was a self-inflicted hour: the outage that triggered this whole refactor was a manager node going down with Portainer's data volume on it, at a moment when nobody had planned for it.
+
+**The lesson that stuck:** never let your control plane live inside the infrastructure it controls. If Portainer manages the Swarm, Portainer's own state cannot be a Swarm service.
+
+---
+
+## The Backup Restore That Saved the Vault
+
+The other half of the outage above: the dashboard's SQLite database — which holds the built-in Vault, the AES-256-GCM password manager — was on the same manager node that went down, in a bind-mount that had not yet been migrated to NFS.
+
+The node came back up, but the disk didn't. Whatever caused the failure took the local filesystem with it, and the dashboard's data file was gone.
+
+This is the point where a homelab project either has a backup story or doesn't. It turned out there was a nightly cron job on `zs-worker-01` that had been rsyncing the dashboard's data directory for weeks — set up early on, mostly forgotten about, never actually tested end-to-end. The backup from roughly 20 hours before the failure was intact.
+
+Restoring it wasn't just "copy the file back." The Vault's encryption key is derived from each user's login password via PBKDF2 and is never stored anywhere — which is exactly the property that makes the Vault worth using, but it also means there's no way to verify a restored database is *actually* intact without logging in and confirming that stored entries decrypt correctly. A corrupted or partially-written backup would have looked fine until someone tried to open a password entry and got garbage back. That verification step — log in, open a few Vault entries, confirm they decrypt — became a mandatory part of the restore procedure, not an afterthought.
+
+**The lesson:** an untested backup is a hope, not a backup. The rsync job had been running for weeks without anyone confirming a restore actually worked. It happened to work. That's the point where "nightly backup exists" got upgraded to "nightly backup exists *and* the restore path has been exercised for real," and it's also what pushed the storage NFS work higher up the priority list — the dashboard's data now lives on `zs-store-01`, not on whichever node it's scheduled on, which removes this entire failure class going forward.
+
+---
+
+## Choosing NFS Over Alternatives for Shared Storage
+
+Once "Swarm nodes must be disposable" became the rule, something had to hold the data that used to live in per-node bind-mounts. The options considered:
+
+- **GlusterFS / Ceph** — distributed, replicated, resilient to losing a storage node. Also a meaningful operational burden for a single-user homelab: more moving parts, more failure modes to understand, more things that can go subtly wrong at 2 AM. Overkill for the actual requirement here.
+- **A per-node local-storage-plus-sync setup** — essentially rebuilding the same bind-mount problem with extra steps.
+- **Plain NFS** from a dedicated server — boring, decades-old, well-understood, and Docker's `local` volume driver supports NFS mount options natively, so services just declare a volume with `driver_opts` instead of a bind-mount path. No extra sidecar container needed on the Swarm side.
+
+NFS won on simplicity. The honest trade-off: `zs-store-01` is a single point of failure for Swarm service data. That's accepted for a personal homelab, and mitigated the same way the Vault incident got fixed — nightly backups off of NFS to `zs-worker-01`, with a Cloudflare R2 offsite copy planned as the next layer of protection.
+
+One deliberate exception: **PostgreSQL did not move to NFS.** Databases and network filesystems have a long, well-documented history of not getting along — NFS's caching and locking semantics aren't what a database engine expects from local disk, and the failure modes (silent corruption under contention) are worse than the failure modes NFS was adopted to solve. PostgreSQL instead runs directly on `zs-state-01`'s local disk, which is also why that host exists as a separate category from "pure NFS-backed storage" — some state genuinely needs a real, dedicated, non-Swarm machine underneath it.
+
+---
+
 ## Lessons
 
 **Host networking solves a whole class of Swarm problems.** If you're running a per-node agent that other services need to address by node, stop trying to make the overlay work and just bind to the host NIC. Use the Swarm API's `Status.Addr` to get each node's address dynamically. It's simpler and more reliable.
@@ -125,3 +191,9 @@ For services that don't have their own authentication (like Stirling-PDF), Cloud
 **Gitops from day one.** Every service configuration is in Git. Every deployment happens via Portainer watching the repo. There has never been a "I made a manual change and forgot to document it" incident because manual changes aren't the workflow.
 
 **Ship the security review before going public.** The security hardening pass before public launch found several real issues: missing HTTP security headers, error responses that leaked internal error messages, a JSON body size limit that didn't exist, and input validation gaps on the service management API. None were catastrophic, but all were worth fixing before real users hit them.
+
+**A control plane cannot live inside the infrastructure it controls.** Portainer managing a Swarm while running as a stateful service *on* that Swarm is a bootstrapping trap — the day you need Portainer most is the day a node holding its data went down. Pulling it out to a dedicated, non-Swarm host fixed this permanently.
+
+**Untested backups are a hope, not a backup.** The rsync job that saved the Vault had been running unverified for weeks. It happened to work. Now every restore includes an explicit verification step — log in, open a few entries, confirm they decrypt — because "the file copied successfully" and "the data is actually usable" are different claims.
+
+**Stateless is a design decision, not a default.** Docker Swarm doesn't make your services stateless for you; it just makes it easy to *forget* where state actually lives until a node dies. Deciding upfront that the Swarm holds zero persistent data — and giving that data exactly two homes (NFS for volumes, a dedicated host for anything that needs real local disk) — turned "which node is my data on?" from a live incident question into a non-question.
