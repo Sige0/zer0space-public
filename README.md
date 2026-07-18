@@ -2,7 +2,7 @@
 
 > **This is a sanitized public showcase.** Real IPs, Tailscale addresses, domain names, and credentials have been replaced with placeholders (`<NODE_IP>`, `<TAILNET>`, `<DOMAIN>`, etc.). The production configuration lives in a private repository.
 
-Self-hosted homelab on ThinkCentre M910q nodes — Docker Swarm, GitOps, zero exposed origin.
+Self-hosted homelab — Docker Swarm, GitOps, zero exposed origin.
 
 [![Nodes](https://img.shields.io/badge/nodes-9-blue)](#node-inventory)
 [![OS](https://img.shields.io/badge/OS-Debian%2012-informational)](#node-inventory)
