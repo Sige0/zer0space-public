@@ -121,6 +121,7 @@ All nodes run **Debian 12** bare-metal (no Proxmox, no VMs). Docker Engine insta
 | Dashboard | Custom (Node.js + SQLite) | Unified service overview, live node metrics via Glances; data volume on NFS — fully stateless container |
 | Database | PostgreSQL | Runs on `zs-state-01` (local disk, not NFS — see [docs/journey.md](docs/journey.md) for why) |
 | Media | Jellyfin (planned) | Streaming on `zs-state-01` — VPN only, never via Cloudflare (ToS §2.8) |
+| Streaming Frontend | Crimson (self-hosted as `crimson-zer0space`) | Metadata/discovery backend for the streaming site — backend built on [Crimson Haven's `crimson-backend`](https://github.com/crimsonhaven-to/crimson-backend), sits in front of the media library, brings no content of its own |
 | Storage | NFS (`zs-store-01`) | Central storage server — backs every Swarm service volume and the media library |
 | Backup | Nightly rsync/tar → NFS (`zs-worker-01`) | Cloudflare R2 offsite copy planned |
 | Passwords | Vault (built into Dashboard) | Native AES-256-GCM password manager, no separate stack |
@@ -262,6 +263,12 @@ zer0space/
 
 - [docs/journey.md](docs/journey.md) — build story: what went wrong, what was learned, and why specific decisions were made
 - [examples/](examples/) — sanitized, generic Docker Compose templates
+
+---
+
+## Acknowledgments
+
+The streaming site's backend is built on [**Crimson**](https://github.com/crimsonhaven-to) by Crimson Haven — specifically [`crimson-backend`](https://github.com/crimsonhaven-to/crimson-backend), a FastAPI metadata/discovery engine. It ships with no content sources of its own; this instance (`crimson-zer0space`) points it at this homelab's own media library. Props to Crimson Haven for the framework.
 
 ---
 

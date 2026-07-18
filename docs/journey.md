@@ -180,6 +180,14 @@ One deliberate exception: **PostgreSQL did not move to NFS.** Databases and netw
 
 ---
 
+## Not Reinventing the Streaming Backend
+
+The streaming frontend didn't need a custom metadata engine built from scratch — [Crimson Haven's `crimson-backend`](https://github.com/crimsonhaven-to/crimson-backend) already does the unglamorous part well: TMDB/AniList metadata mapping, orchestration, NDJSON streaming. It's deliberately "bring your own sources" — it ships with no content of its own, which is exactly the right shape for pointing it at a self-hosted media library instead of anything shady.
+
+This instance runs self-hosted as `crimson-zer0space`, in front of the media library described above. Props to Crimson Haven for open-sourcing it — it saved weeks that would otherwise have gone into rebuilding metadata plumbing instead of the parts of this homelab that are actually novel.
+
+---
+
 ## Lessons
 
 **Host networking solves a whole class of Swarm problems.** If you're running a per-node agent that other services need to address by node, stop trying to make the overlay work and just bind to the host NIC. Use the Swarm API's `Status.Addr` to get each node's address dynamically. It's simpler and more reliable.
