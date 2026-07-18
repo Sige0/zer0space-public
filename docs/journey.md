@@ -46,7 +46,7 @@ This is not a configuration error on either side. It's a version mismatch betwee
 
 The workaround options are all bad: give Traefik direct socket access (defeats the point of the proxy), patch the proxy config to allow 1.24 (weakens the security posture), or use Traefik v2 (goes against the grain on a new setup).
 
-**Decision: drop Traefik entirely.** Since `cloudflared` routes directly to service DNS names in the overlay network, there's no need for a reverse proxy layer at all. Traefik's stack is kept in the repo for reference but not deployed.
+**Decision: drop Traefik entirely.** Since `cloudflared` routes directly to service DNS names in the overlay network, there's no need for a reverse proxy layer at all. The Traefik stack was kept in the repo for reference for a while, then removed outright once it was clear it would never be revisited — a stack nobody deploys and nobody reads is just noise in the repo.
 
 ---
 
@@ -98,19 +98,29 @@ The dashboard also loads [Tabler Icons](https://tabler.io/icons) from jsDelivr C
 
 ## MFA via Cloudflare Access
 
-Cloudflare Access acts as the outermost authentication layer. Before a request reaches any service, the user must authenticate through an Access policy — in this setup, a GitHub OAuth login.
+Cloudflare Access acts as the outermost authentication layer. Before a request reaches any service, the user must authenticate through an Access policy.
 
-This means:
+The original policy required a GitHub OAuth login — simple to set up, and MFA-strong as long as the GitHub account itself has MFA enabled. The trade-off: it ties access to a GitHub identity specifically, which is fine for a single operator but doesn't generalize well the moment anyone else — family, friends, anyone without a GitHub habit — needs a login of their own. **The policy has since moved to Cloudflare Access's built-in Email OTP + Authenticator (TOTP) flow** instead: a one-time code to a specific email address, backed by a standard TOTP authenticator app for the second factor. Same MFA guarantee, no dependency on a specific third-party identity provider.
+
+The flow today:
 
 1. The browser hits `dashboard.<DOMAIN>`.
 2. Cloudflare checks for a valid Access session cookie.
-3. If missing or expired, it redirects to the GitHub OAuth flow.
-4. After a successful GitHub login (and the GitHub account matching the allowed identity), Cloudflare issues a JWT and sets the Access session cookie.
+3. If missing or expired, it prompts for the allow-listed email address, sends a one-time code, and then asks for the TOTP code from an authenticator app.
+4. Once both factors check out, Cloudflare issues a JWT and sets the Access session cookie.
 5. Only then does the request travel through the tunnel to the dashboard container.
 
 The dashboard itself also has its own login (bcrypt + session cookie). That's intentional — the dashboard has roles (admin vs. viewer) that Cloudflare Access can't model, and the built-in Vault requires authentication to derive the encryption key. Cloudflare Access is the perimeter; the dashboard's own auth is the application layer.
 
 For services that don't have their own authentication (like Stirling-PDF), Cloudflare Access provides the only gate. That's sufficient for a single-user homelab.
+
+---
+
+## Authentik: Evaluated, Not Adopted
+
+Before settling on Cloudflare Access's built-in MFA, a self-hosted identity provider — Authentik — was evaluated as an alternative. It's a capable project: full SSO, its own MFA flows, fine-grained policy control.
+
+It didn't get adopted, for the same reason Portainer's original placement was a problem: it would have been another stateful service to keep alive, backed by its own database, sitting in the critical path of every login. Cloudflare Access already does the perimeter-MFA job, is maintained by someone else, and adds zero state to a homelab that had just spent real effort becoming stateless. Authentik remains a good option for anyone who wants SSO across many internal apps or needs an identity provider independent of a specific cloud vendor — it just wasn't the right trade for this setup.
 
 ---
 
@@ -127,7 +137,17 @@ That line only works if persistent data has somewhere else to live, so the clust
 - **`zs-store-01`**, an NFS server. Every Swarm service that needs a data volume mounts it from here instead of a local path. Docker's `local` volume driver with `type: nfs` options makes this a drop-in replacement for a bind-mount from the service's point of view — see [examples/nfs-volume-service.yml](../examples/nfs-volume-service.yml).
 - **`zs-state-01`**, a plain-Docker host (deliberately *not* a Swarm member) for the handful of things that genuinely want local, low-latency disk instead of a network filesystem — PostgreSQL being the main one. More on why Postgres didn't just go on NFS below.
 
-The result: the Swarm went from 6 nodes to 7 (a fourth worker, `zs-worker-04`, was added around the same time for extra headroom), and the homelab as a whole went from 7 devices to 9. But the meaningful change isn't the node count — it's that all 7 Swarm nodes are now genuinely disposable, and only two machines in the whole fleet actually need to be treated carefully.
+The result: the Swarm went from 6 nodes to 7, and the homelab as a whole went from 7 devices to 9. But the meaningful change isn't the node count — it's that all 7 Swarm nodes are now genuinely disposable, and only two machines in the whole fleet actually need to be treated carefully.
+
+---
+
+## Turning a Worker Into the Stateful Host
+
+`zs-state-01` didn't arrive as new hardware. It used to be `zs-worker-04`, an ordinary Swarm worker — pulled out of the Swarm, repurposed as the dedicated stateful host, and given a new hostname to match its new job.
+
+The reasoning was pragmatic rather than dramatic: the refactor needed a machine to hold PostgreSQL and a standalone Portainer, and there was already a worker sitting in the fleet with enough headroom for that job. Buying new hardware for a role that an existing box could fill would have been the more "correct-looking" move on paper, but not a better one in practice — mini PCs in this class are cheap and interchangeable, and repurposing one turns "add a new category of host" into "relabel a box and change what runs on it."
+
+The Swarm still needed four workers, so a replacement `zs-worker-04` was added afterward — newer hardware, more RAM (16 GB vs. the original 8 GB), and running Debian 13 rather than 12, since it was a fresh install rather than a carried-over one. That's also why the node fleet now runs a mix of Debian 12 and 13: existing nodes stayed on whatever they were installed with, and only new or replaced nodes get the newer release. There was no motivation to force an upgrade across nodes that were already working fine.
 
 ---
 
@@ -178,6 +198,20 @@ NFS won on simplicity. The honest trade-off: `zs-store-01` is a single point of 
 
 One deliberate exception: **PostgreSQL did not move to NFS.** Databases and network filesystems have a long, well-documented history of not getting along — NFS's caching and locking semantics aren't what a database engine expects from local disk, and the failure modes (silent corruption under contention) are worse than the failure modes NFS was adopted to solve. PostgreSQL instead runs directly on `zs-state-01`'s local disk, which is also why that host exists as a separate category from "pure NFS-backed storage" — some state genuinely needs a real, dedicated, non-Swarm machine underneath it.
 
+That exact reasoning is also what killed the dashboard's SQLite file as a long-term design, covered next.
+
+---
+
+## Migrating the Dashboard from SQLite to PostgreSQL
+
+The dashboard's data — users, service list, themes, and the Vault — started out in a SQLite file, moved onto NFS during the stateless refactor so the container itself could be scheduled anywhere. That fixed the "which node is my data on?" problem, but it traded it for a smaller, quieter one: SQLite is a single-writer, file-locking database, and NFS's locking semantics are exactly the ones databases don't get along with (the same reasoning that kept PostgreSQL itself off NFS, above). It mostly worked. "Mostly" is not a word that belongs anywhere near a password vault.
+
+The fix was to stop asking a file-based database to behave like a network service, and instead give the dashboard an actual network database: **PostgreSQL, running on `zs-state-01`**. The dashboard connects to it the same way any other client would — over the network, with a connection string, no file locking involved.
+
+The migration itself was a one-off script (`scripts/migrate-sqlite-to-pg.js`) rather than a general-purpose tool: read every table out of the old SQLite file, recreate the schema in PostgreSQL, insert the rows, and — because this touched the Vault — verify every entry decrypted correctly on the other side before considering the old file safe to retire. That verification step existed for the same reason it exists in the backup-restore process: a successful-looking data copy and a *usable* one are different claims, and the Vault is exactly the place where that distinction matters most.
+
+The result: the dashboard container went from "stateless as long as its NFS-mounted SQLite file behaves" to genuinely stateless — no local file, no NFS locking edge cases, just a client talking to a real database over the network.
+
 ---
 
 ## Not Reinventing the Streaming Backend
@@ -205,3 +239,7 @@ This instance runs self-hosted as `crimson-zer0space`, in front of the media lib
 **Untested backups are a hope, not a backup.** The rsync job that saved the Vault had been running unverified for weeks. It happened to work. Now every restore includes an explicit verification step — log in, open a few entries, confirm they decrypt — because "the file copied successfully" and "the data is actually usable" are different claims.
 
 **Stateless is a design decision, not a default.** Docker Swarm doesn't make your services stateless for you; it just makes it easy to *forget* where state actually lives until a node dies. Deciding upfront that the Swarm holds zero persistent data — and giving that data exactly two homes (NFS for volumes, a dedicated host for anything that needs real local disk) — turned "which node is my data on?" from a live incident question into a non-question.
+
+**A file on network storage is not the same thing as a network database.** Moving the dashboard's SQLite file onto NFS solved the node-scheduling problem but kept the underlying mismatch between file-locking semantics and a network filesystem. If a service's data model assumes a real database, give it one — don't just relocate the file.
+
+**Repurpose hardware before buying more.** `zs-state-01` is a former Swarm worker, not new hardware. In a homelab of interchangeable mini PCs, relabeling a box and changing what runs on it is almost always less work — and less to maintain — than adding a new category of machine.
